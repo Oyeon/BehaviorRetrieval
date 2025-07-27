@@ -18,9 +18,12 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import time
 
-# Add local embedding extractor (now in same directory)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-from local_embedding_fix import LocalBYOLEmbeddingExtractor
+# Add original BehaviorRetrieval visual encoder (ResNet18 + SpatialSoftmax)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from torchvision import transforms
 
 ################################################################################
 #                           RT-Cache Integration (Local Embeddings)
@@ -84,24 +87,96 @@ def normalize_franka_action(raw_action):
     return np.array(pos + ori + [grip], dtype=np.float32)
 
 ################################################################################
-#                           Simplified Neural Networks
+#                           Original BehaviorRetrieval Architecture
 ################################################################################
 
+class SpatialSoftmax(nn.Module):
+    """Original SpatialSoftmax from BehaviorRetrieval (matches robomimic)"""
+    def __init__(self, height, width, num_kp=32, temperature=1.0):
+        super(SpatialSoftmax, self).__init__()
+        self.height = height
+        self.width = width
+        self.num_kp = num_kp
+        self.temperature = temperature
+        
+        # Create coordinate meshgrid
+        pos_x, pos_y = torch.meshgrid(
+            torch.linspace(-1, 1, width),
+            torch.linspace(-1, 1, height),
+            indexing='xy'
+        )
+        self.register_buffer('pos_x', pos_x)
+        self.register_buffer('pos_y', pos_y)
+    
+    def forward(self, feature):
+        """
+        feature: [B, C, H, W]
+        output: [B, C * 2] (x, y coordinates for each channel)
+        """
+        B, C, H, W = feature.shape
+        
+        # Apply temperature and softmax
+        attention = F.softmax(feature.view(B, C, -1) / self.temperature, dim=-1)
+        attention = attention.view(B, C, H, W)
+        
+        # Compute expected coordinates
+        expected_x = torch.sum(attention * self.pos_x, dim=[2, 3])  # [B, C]
+        expected_y = torch.sum(attention * self.pos_y, dim=[2, 3])  # [B, C]
+        
+        # Concatenate x, y coordinates
+        keypoints = torch.cat([expected_x, expected_y], dim=1)  # [B, 2*C]
+        return keypoints
+
+class VisualEncoder(nn.Module):
+    """Original BehaviorRetrieval visual encoder: ResNet18 + SpatialSoftmax"""
+    def __init__(self, feature_dim=128, num_kp=32):
+        super(VisualEncoder, self).__init__()
+        
+        # ResNet18 backbone (NO pretraining as per original config)
+        resnet = models.resnet18(pretrained=False)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # Remove avgpool and fc
+        
+        # Get feature map dimensions (ResNet18 outputs 512 channels)
+        # After conv layers: [B, 512, H, W] where H,W depend on input size
+        self.conv_channels = 512
+        
+        # SpatialSoftmax pooling
+        self.spatial_softmax = SpatialSoftmax(height=7, width=7, num_kp=num_kp)  # Assume 7x7 after ResNet18
+        
+        # Final linear layer to desired feature dimension
+        self.fc = nn.Linear(self.conv_channels * 2, feature_dim)  # *2 for (x,y) coordinates
+        
+    def forward(self, x):
+        """
+        x: [B, 3, 224, 224] RGB images
+        output: [B, feature_dim] visual features
+        """
+        # ResNet18 feature extraction
+        features = self.backbone(x)  # [B, 512, H, W]
+        
+        # SpatialSoftmax pooling
+        keypoints = self.spatial_softmax(features)  # [B, 512*2]
+        
+        # Final linear projection
+        output = self.fc(keypoints)  # [B, feature_dim]
+        
+        return output
+
 class VAE(nn.Module):
-    """Shallow VAE for re-embedding state-action pairs"""
-    def __init__(self, input_dim=2048, latent_dim=128):
+    """Original BehaviorRetrieval VAE architecture"""
+    def __init__(self, input_dim=128, latent_dim=128):  # 128-D visual features, not 2048-D
         super(VAE, self).__init__()
         
-        # Encoder
-        self.fc1 = nn.Linear(input_dim, 1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc_mu = nn.Linear(512, latent_dim)
-        self.fc_logvar = nn.Linear(512, latent_dim)
+        # Encoder (following original config: [300, 400] layer dims)
+        self.fc1 = nn.Linear(input_dim, 300)
+        self.fc2 = nn.Linear(300, 400)
+        self.fc_mu = nn.Linear(400, latent_dim)
+        self.fc_logvar = nn.Linear(400, latent_dim)
         
-        # Decoder
-        self.fc3 = nn.Linear(latent_dim, 512)
-        self.fc4 = nn.Linear(512, 1024)
-        self.fc5 = nn.Linear(1024, input_dim)
+        # Decoder (following original config: [300, 400] layer dims)
+        self.fc3 = nn.Linear(latent_dim, 300)
+        self.fc4 = nn.Linear(300, 400)
+        self.fc5 = nn.Linear(400, input_dim)
         
     def encode(self, x):
         h1 = F.relu(self.fc1(x))
@@ -141,16 +216,24 @@ class BehaviorCloning(nn.Module):
 ################################################################################
 
 class OpenXDataset(Dataset):
-    """LOCAL embedding dataset for Behavior Retrieval"""
+    """Dataset using original BehaviorRetrieval visual encoder"""
     def __init__(self, datasets=DATASETS, max_samples_per_dataset=1000, device='cuda'):
         self.data = []
         self.device = device
         
-        print(f"Loading Open-X data from {len(datasets)} datasets using LOCAL embeddings...")
-        print("✅ Using frozen ResNet-50 BYOL embeddings (following research objective)")
+        print(f"Loading Open-X data from {len(datasets)} datasets using ORIGINAL BehaviorRetrieval architecture...")
+        print("✅ Using ResNet18 + SpatialSoftmax (following original implementation)")
         
-        # Initialize local embedding extractor
-        self.embedding_extractor = LocalBYOLEmbeddingExtractor(device=device)
+        # Initialize original visual encoder (ResNet18 + SpatialSoftmax)
+        self.visual_encoder = VisualEncoder(feature_dim=128, num_kp=32).to(device)
+        self.visual_encoder.eval()
+        
+        # Image preprocessing for ResNet18
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
         
         exclusion_dataset_list = []
         
@@ -234,11 +317,14 @@ class OpenXDataset(Dataset):
                             
                             image_pil = Image.fromarray(img_array)
                             
-                            # LOCAL embedding extraction
+                            # Original BehaviorRetrieval visual encoding
                             try:
-                                embedding = self.embedding_extractor.extract_embedding(image_pil)  # [2048]
+                                image_tensor = self.transform(image_pil).unsqueeze(0).to(self.device)
+                                with torch.no_grad():
+                                    visual_features = self.visual_encoder(image_tensor)  # [1, 128]
+                                embedding = visual_features.cpu().numpy().squeeze(0)  # [128]
                             except Exception as e:
-                                print(f"Local embedding failed, skipping. Error: {e}")
+                                print(f"Visual encoding failed, skipping. Error: {e}")
                                 continue
                             
                             self.data.append({
@@ -290,7 +376,7 @@ def train_behavior_retrieval(args):
     print(f"Using device: {device}")
     
     # Load dataset
-    print("Loading Open-X dataset with LOCAL BYOL embeddings...")
+    print("Loading Open-X dataset with ORIGINAL BehaviorRetrieval architecture...")
     dataset = OpenXDataset(
         datasets=DATASETS,  # Use all 19 datasets for proper training
         max_samples_per_dataset=args.max_samples,
@@ -309,8 +395,8 @@ def train_behavior_retrieval(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Initialize models
-    vae = VAE(input_dim=2048, latent_dim=128).to(device)
+    # Initialize models (128-D visual features as per original)
+    vae = VAE(input_dim=128, latent_dim=128).to(device)
     bc = BehaviorCloning(latent_dim=128, action_dim=7).to(device)
     
     # Optimizers
@@ -419,7 +505,7 @@ def main():
     # Train models
     models = train_behavior_retrieval(args)
     
-    print("✅ Behavior Retrieval training completed with LOCAL embeddings!")
+    print("✅ Behavior Retrieval training completed with ORIGINAL architecture!")
 
 if __name__ == '__main__':
     main()
