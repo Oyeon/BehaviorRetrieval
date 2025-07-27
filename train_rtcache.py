@@ -20,12 +20,21 @@ import h5py
 from tqdm import tqdm
 import tempfile
 
-# Add robomimic modules
-sys.path.append('/Users/owen/Projects/rt_cache_ref/BehaviorRetrieval')
-import robomimic.utils.train_utils as TrainUtils
-import robomimic.utils.torch_utils as TorchUtils
-from robomimic.config import config_factory
-from robomimic.algo import algo_factory
+# Add robomimic modules (fix path for different environments)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+sys.path.append(os.path.join(current_dir, 'robomimic'))
+
+try:
+    import robomimic.utils.train_utils as TrainUtils
+    import robomimic.utils.torch_utils as TorchUtils
+    from robomimic.config import config_factory
+    from robomimic.algo import algo_factory
+    ROBOMIMIC_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: robomimic not available: {e}")
+    print("Will use simplified training approach")
+    ROBOMIMIC_AVAILABLE = False
 
 ################################################################################
 #                           RT-Cache Integration (Same as VINN)

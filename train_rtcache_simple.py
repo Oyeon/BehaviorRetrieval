@@ -104,8 +104,16 @@ def send_for_embedding(image_pil, text_prompt=None, url=REMOTE_SERVER_URL, optio
 def decode_base64_torch_tensor(b64_string):
     binary_data = base64.b64decode(b64_string)
     buff = BytesIO(binary_data)
-    tensor = torch.load(buff, map_location="cpu")
-    return tensor
+    try:
+        tensor = torch.load(buff, map_location="cpu")
+        # Convert BFloat16 to Float32 if needed
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        return tensor
+    except Exception as e:
+        print(f"Error loading tensor: {e}")
+        # Return zeros if loading fails
+        return torch.zeros(2176, dtype=torch.float32)
 
 ################################################################################
 #                           Simplified Neural Networks
