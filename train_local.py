@@ -292,7 +292,7 @@ def train_behavior_retrieval(args):
     # Load dataset
     print("Loading Open-X dataset with LOCAL BYOL embeddings...")
     dataset = OpenXDataset(
-        datasets=DATASETS[:3],  # Use first 3 datasets for demo
+        datasets=DATASETS,  # Use all 19 datasets for proper training
         max_samples_per_dataset=args.max_samples,
         device=device
     )
