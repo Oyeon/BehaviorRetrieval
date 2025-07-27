@@ -18,9 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import time
 
-# Add local embedding extractor
+# Add local embedding extractor (now in same directory)
 current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.dirname(current_dir))
 from local_embedding_fix import LocalBYOLEmbeddingExtractor
 
 ################################################################################
@@ -90,7 +89,7 @@ def normalize_franka_action(raw_action):
 
 class VAE(nn.Module):
     """Shallow VAE for re-embedding state-action pairs"""
-    def __init__(self, input_dim=2176, latent_dim=128):
+    def __init__(self, input_dim=2048, latent_dim=128):
         super(VAE, self).__init__()
         
         # Encoder
@@ -237,7 +236,7 @@ class OpenXDataset(Dataset):
                             
                             # LOCAL embedding extraction
                             try:
-                                embedding = self.embedding_extractor.extract_embedding(image_pil)  # [2176]
+                                embedding = self.embedding_extractor.extract_embedding(image_pil)  # [2048]
                             except Exception as e:
                                 print(f"Local embedding failed, skipping. Error: {e}")
                                 continue
@@ -311,7 +310,7 @@ def train_behavior_retrieval(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
     # Initialize models
-    vae = VAE(input_dim=2176, latent_dim=128).to(device)
+    vae = VAE(input_dim=2048, latent_dim=128).to(device)
     bc = BehaviorCloning(latent_dim=128, action_dim=7).to(device)
     
     # Optimizers
