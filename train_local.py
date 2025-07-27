@@ -116,7 +116,7 @@ class VAE(nn.Module):
     def decode(self, z):
         h3 = F.relu(self.fc3(z))
         h4 = F.relu(self.fc4(h3))
-        return torch.sigmoid(self.fc5(h4))
+        return self.fc5(h4)  # Removed sigmoid for real-valued embeddings
     
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -278,10 +278,10 @@ class OpenXDataset(Dataset):
 ################################################################################
 
 def vae_loss(recon_x, x, mu, logvar):
-    """VAE loss function"""
-    BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
+    """VAE loss function (using MSE for real-valued embeddings)"""
+    MSE = F.mse_loss(recon_x, x, reduction='sum')  # Changed from BCE to MSE for real-valued embeddings
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return BCE + KLD
+    return MSE + KLD
 
 def train_behavior_retrieval(args):
     """Train Behavior Retrieval with VAE + BC using LOCAL embeddings"""
