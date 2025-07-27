@@ -163,12 +163,17 @@ class VisualEncoder(nn.Module):
         return output
 
 class VAE(nn.Module):
-    """Original BehaviorRetrieval VAE architecture"""
-    def __init__(self, input_dim=128, latent_dim=128):  # 128-D visual features, not 2048-D
+    """Original BehaviorRetrieval VAE: takes observation+action, reconstructs observation+action"""
+    def __init__(self, visual_dim=128, action_dim=7, latent_dim=128):
         super(VAE, self).__init__()
         
+        self.visual_dim = visual_dim
+        self.action_dim = action_dim
+        self.input_dim = visual_dim + action_dim  # 128 + 7 = 135
+        self.latent_dim = latent_dim
+        
         # Encoder (following original config: [300, 400] layer dims)
-        self.fc1 = nn.Linear(input_dim, 300)
+        self.fc1 = nn.Linear(self.input_dim, 300)
         self.fc2 = nn.Linear(300, 400)
         self.fc_mu = nn.Linear(400, latent_dim)
         self.fc_logvar = nn.Linear(400, latent_dim)
@@ -176,7 +181,7 @@ class VAE(nn.Module):
         # Decoder (following original config: [300, 400] layer dims)
         self.fc3 = nn.Linear(latent_dim, 300)
         self.fc4 = nn.Linear(300, 400)
-        self.fc5 = nn.Linear(400, input_dim)
+        self.fc5 = nn.Linear(400, self.input_dim)  # Reconstruct visual+action
         
     def encode(self, x):
         h1 = F.relu(self.fc1(x))
@@ -194,9 +199,27 @@ class VAE(nn.Module):
         return self.fc5(h4)  # Removed sigmoid for real-valued embeddings
     
     def forward(self, x):
+        """
+        x: concatenated [visual_features, actions] of shape [B, 135]
+        """
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
+    
+    def compute_embeddings(self, visual_features, actions):
+        """
+        Original BehaviorRetrieval embedding computation:
+        Returns VAE latent + actions concatenated (as in classifier.py line 197)
+        """
+        # Concatenate visual features and actions
+        combined_input = torch.cat([visual_features, actions], dim=1)  # [B, 135]
+        
+        # Encode to get latent
+        mu, logvar = self.encode(combined_input)
+        
+        # Return latent + actions concatenated (following original)
+        embeddings = torch.cat([mu, actions], dim=1)  # [B, latent_dim + action_dim]
+        return embeddings
 
 class BehaviorCloning(nn.Module):
     """BC head for action prediction"""
@@ -328,8 +351,8 @@ class OpenXDataset(Dataset):
                                 continue
                             
                             self.data.append({
-                                'embedding': embedding,
-                                'action': norm_action,
+                                'visual_features': embedding,  # [128] visual features
+                                'action': norm_action,          # [7] actions 
                                 'dataset': dataset_name
                             })
                             sample_count += 1
@@ -355,19 +378,36 @@ class OpenXDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        embedding = torch.FloatTensor(item['embedding'])
-        action = torch.FloatTensor(item['action'])
-        return embedding, action
+        visual_features = torch.FloatTensor(item['visual_features'])  # [128]
+        action = torch.FloatTensor(item['action'])                    # [7]
+        return visual_features, action
 
 ################################################################################
 #                           Training Functions
 ################################################################################
 
-def vae_loss(recon_x, x, mu, logvar):
-    """VAE loss function (using MSE for real-valued embeddings)"""
-    MSE = F.mse_loss(recon_x, x, reduction='sum')  # Changed from BCE to MSE for real-valued embeddings
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return MSE + KLD
+def vae_loss(recon_x, x, mu, logvar, visual_dim=128, action_dim=7, kl_weight=0.0001):
+    """
+    Original BehaviorRetrieval VAE loss function
+    Reconstructs both visual features (128D) and actions (7D)
+    """
+    # Split reconstruction and target into visual and action components
+    recon_visual = recon_x[:, :visual_dim]      # [B, 128] 
+    recon_action = recon_x[:, visual_dim:]      # [B, 7]
+    target_visual = x[:, :visual_dim]           # [B, 128]
+    target_action = x[:, visual_dim:]           # [B, 7]
+    
+    # Reconstruction loss for both components
+    visual_mse = F.mse_loss(recon_visual, target_visual, reduction='sum')
+    action_mse = F.mse_loss(recon_action, target_action, reduction='sum')
+    reconstruction_loss = visual_mse + action_mse
+    
+    # KL divergence loss
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    # Combined loss (following original kl_weight from config)
+    total_loss = reconstruction_loss + kl_weight * kl_loss
+    return total_loss
 
 def train_behavior_retrieval(args):
     """Train Behavior Retrieval with VAE + BC using LOCAL embeddings"""
@@ -395,9 +435,10 @@ def train_behavior_retrieval(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Initialize models (128-D visual features as per original)
-    vae = VAE(input_dim=128, latent_dim=128).to(device)
-    bc = BehaviorCloning(latent_dim=128, action_dim=7).to(device)
+    # Initialize models (original architecture: visual_dim=128, action_dim=7)
+    vae = VAE(visual_dim=128, action_dim=7, latent_dim=128).to(device)
+    # BC takes VAE latent + actions as input (128 + 7 = 135 dimensions)
+    bc = BehaviorCloning(latent_dim=128 + 7, action_dim=7).to(device)
     
     # Optimizers
     vae_optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
@@ -409,12 +450,16 @@ def train_behavior_retrieval(args):
     
     for epoch in range(args.vae_epochs):
         total_loss = 0
-        for embeddings, actions in tqdm(train_loader, desc=f"VAE Epoch {epoch+1}"):
-            embeddings = embeddings.to(device)
+        for visual_features, actions in tqdm(train_loader, desc=f"VAE Epoch {epoch+1}"):
+            visual_features = visual_features.to(device)  # [B, 128]
+            actions = actions.to(device)                  # [B, 7]
+            
+            # Create joint input (visual + action) as per original
+            joint_input = torch.cat([visual_features, actions], dim=1)  # [B, 135]
             
             vae_optimizer.zero_grad()
-            recon_batch, mu, logvar = vae(embeddings)
-            loss = vae_loss(recon_batch, embeddings, mu, logvar)
+            recon_batch, mu, logvar = vae(joint_input)
+            loss = vae_loss(recon_batch, joint_input, mu, logvar)
             loss.backward()
             vae_optimizer.step()
             
@@ -431,17 +476,16 @@ def train_behavior_retrieval(args):
     
     for epoch in range(args.bc_epochs):
         total_loss = 0
-        for embeddings, actions in tqdm(train_loader, desc=f"BC Epoch {epoch+1}"):
-            embeddings = embeddings.to(device)
-            actions = actions.to(device)
+        for visual_features, actions in tqdm(train_loader, desc=f"BC Epoch {epoch+1}"):
+            visual_features = visual_features.to(device)  # [B, 128]
+            actions = actions.to(device)                  # [B, 7]
             
-            # Get VAE latent representation
+            # Get VAE embeddings (latent + actions concatenated) following original
             with torch.no_grad():
-                mu, logvar = vae.encode(embeddings)
-                z = vae.reparameterize(mu, logvar)
+                embeddings = vae.compute_embeddings(visual_features, actions)  # [B, latent_dim + action_dim]
             
             bc_optimizer.zero_grad()
-            predicted_actions = bc(z)
+            predicted_actions = bc(embeddings)
             loss = criterion(predicted_actions, actions)
             loss.backward()
             bc_optimizer.step()
@@ -465,13 +509,13 @@ def train_behavior_retrieval(args):
     
     total_error = 0
     with torch.no_grad():
-        for embeddings, actions in val_loader:
-            embeddings = embeddings.to(device)
-            actions = actions.to(device)
+        for visual_features, actions in val_loader:
+            visual_features = visual_features.to(device)  # [B, 128]
+            actions = actions.to(device)                  # [B, 7]
             
-            mu, logvar = vae.encode(embeddings)
-            z = vae.reparameterize(mu, logvar)
-            predicted_actions = bc(z)
+            # Get VAE embeddings (latent + actions concatenated)
+            embeddings = vae.compute_embeddings(visual_features, actions)  # [B, 135]
+            predicted_actions = bc(embeddings)
             
             error = F.mse_loss(predicted_actions, actions)
             total_error += error.item()
@@ -493,7 +537,9 @@ def main():
     args = parser.parse_args()
     
     print("=" * 80)
-    print("Behavior Retrieval Training with LOCAL BYOL Embeddings (No Server Dependency)")
+    print("Behavior Retrieval Training - CORRECTED Original Architecture")
+    print("VAE: ResNet18+SpatialSoftmax (128D) + Actions (7D) → Latent (128D)")
+    print("Embeddings: VAE Latent (128D) + Actions (7D) = 135D")
     print("=" * 80)
     print(f"VAE epochs: {args.vae_epochs}")
     print(f"BC epochs: {args.bc_epochs}")
@@ -505,7 +551,9 @@ def main():
     # Train models
     models = train_behavior_retrieval(args)
     
-    print("✅ Behavior Retrieval training completed with ORIGINAL architecture!")
+    print("✅ Behavior Retrieval training completed with CORRECTED original architecture!")
+    print("✅ VAE now properly reconstructs visual+action pairs (135D total)")
+    print("✅ Embeddings now include both VAE latent + action components")
 
 if __name__ == '__main__':
     main()
