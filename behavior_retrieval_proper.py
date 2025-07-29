@@ -346,12 +346,22 @@ class BehaviorRetrieval:
 #                               Dataset & Training
 ################################################################################
 
+# Complete Open-X datasets (all 19 for full training)
 DATASETS = [
     "berkeley_cable_routing", "roboturk", "nyu_door_opening_surprising_effectiveness", 
     "viola", "berkeley_autolab_ur5", "toto", "columbia_cairlab_pusht_real", 
     "austin_sirius_dataset_converted_externally_to_rlds", 
     "austin_sailor_dataset_converted_externally_to_rlds", 
-    "utokyo_xarm_pick_and_place_converted_externally_to_rlds"
+    "utokyo_xarm_pick_and_place_converted_externally_to_rlds", 
+    
+    "tokyo_u_lsmo_converted_externally_to_rlds", 
+    "dlr_sara_pour_converted_externally_to_rlds", "dlr_sara_grid_clamp_converted_externally_to_rlds", 
+    "dlr_edan_shared_control_converted_externally_to_rlds", "asu_table_top_converted_externally_to_rlds", 
+    "stanford_robocook_converted_externally_to_rlds", "utaustin_mutex",
+
+    'fractal20220817_data',
+    'kuka', 
+    'bridge'
 ]
 
 def dataset2path(dataset_name):
@@ -381,7 +391,7 @@ class SimplifiedOpenXDataset(Dataset):
         
         print(f"Loading simplified dataset...")
         
-        for dataset_name in datasets[:3]:  # Limit for testing
+        for dataset_name in datasets:  # Use ALL datasets for full training
             print(f"Processing {dataset_name}...")
             try:
                 builder = tfds.builder_from_directory(builder_dir=dataset2path(dataset_name))
@@ -472,8 +482,8 @@ def main():
     
     # Load datasets
     print("Loading datasets...")
-    prior_dataset = SimplifiedOpenXDataset(DATASETS, max_samples_per_dataset=2000, device=device)
-    task_dataset = SimplifiedOpenXDataset(DATASETS[-1:], max_samples_per_dataset=100, device=device)  # Small task dataset
+    prior_dataset = SimplifiedOpenXDataset(DATASETS, max_samples_per_dataset=10000, device=device)
+    task_dataset = SimplifiedOpenXDataset(DATASETS[-3:], max_samples_per_dataset=1000, device=device)  # 27-episode equivalent task dataset
     
     # Run three phases
     print("\n" + "="*60)
@@ -481,13 +491,13 @@ def main():
     print("="*60)
     
     # Phase 1: Train VAE similarity metric
-    br.phase1_train_vae(prior_dataset, epochs=100)  # Reduced for testing
+    br.phase1_train_vae(prior_dataset, epochs=500)  # Full VAE training
     
     # Phase 2: Retrieve relevant data
     retrieved_states, retrieved_actions = br.phase2_retrieve_data(task_dataset, delta=0.7)
     
     # Phase 3: Train policy
-    policy = br.phase3_train_policy(task_dataset, retrieved_states, retrieved_actions, epochs=100)
+    policy = br.phase3_train_policy(task_dataset, retrieved_states, retrieved_actions, epochs=300)
     
     print("\n✅ PROPER BehaviorRetrieval training completed!")
     print("✅ Three-phase algorithm executed successfully")
